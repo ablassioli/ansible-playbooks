@@ -1,0 +1,10 @@
+---
+- name: Atualizar servidores Linux
+  hosts: linux
+  become: true
+
+  tasks:
+    - name: Atualizar todos os pacotes
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest

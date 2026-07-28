@@ -1,0 +1,11 @@
+---
+- name: Atualizar servidores Windows
+  hosts: windows
+
+  tasks:
+    - name: Instalar atualizações críticas e de segurança
+      ansible.windows.win_updates:
+        category_names:
+          - CriticalUpdates
+          - SecurityUpdates
+        reboot: true

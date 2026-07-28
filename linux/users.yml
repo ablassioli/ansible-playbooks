@@ -1,0 +1,10 @@
+---
+- name: Gerenciar usuários Linux
+  hosts: linux
+  become: true
+
+  tasks:
+    - name: Criar usuário de exemplo
+      ansible.builtin.user:
+        name: usuario_exemplo
+        state: present

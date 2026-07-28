@@ -1,0 +1,5 @@
+[linux]
+servidor-linux-homolog ansible_host=192.168.2.10
+
+[windows]
+servidor-windows-homolog ansible_host=192.168.2.20

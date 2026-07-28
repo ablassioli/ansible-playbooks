@@ -1,0 +1,13 @@
+---
+- name: Instalar pacotes Linux
+  hosts: linux
+  become: true
+
+  tasks:
+    - name: Instalar pacotes básicos
+      ansible.builtin.dnf:
+        name:
+          - vim
+          - curl
+          - wget
+        state: present
