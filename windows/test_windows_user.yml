@@ -1,0 +1,157 @@
+# ================================================================
+# Playbook: test_windows_user.yml
+#
+# Objetivo:
+# Validar autenticação WinRM e execução de comandos Windows
+# através do AWX utilizando a credencial configurada no Job Template.
+#
+# Este playbook NÃO realiza alterações permanentes no servidor.
+# ================================================================
+
+- name: "TESTE - Validacao de acesso Windows via AWX"
+  hosts: all
+  gather_facts: false
+
+  tasks:
+
+    # ------------------------------------------------------------
+    # 1. Teste básico do WinRM
+    # ------------------------------------------------------------
+    - name: "01 - Testar conexao WinRM"
+      ansible.windows.win_ping:
+      register: winrm_ping
+
+    - name: "01 - Resultado da conexao WinRM"
+      ansible.builtin.debug:
+        msg: "WinRM respondeu corretamente: {{ winrm_ping.ping }}"
+
+
+    # ------------------------------------------------------------
+    # 2. Identificar usuario autenticado
+    # ------------------------------------------------------------
+    - name: "02 - Identificar usuario conectado"
+      ansible.windows.win_command: whoami
+      register: whoami_result
+      changed_when: false
+
+    - name: "02 - Usuario utilizado pelo AWX"
+      ansible.builtin.debug:
+        msg: "Usuario autenticado no Windows: {{ whoami_result.stdout | trim }}"
+
+
+    # ------------------------------------------------------------
+    # 3. Identificar servidor
+    # ------------------------------------------------------------
+    - name: "03 - Consultar hostname"
+      ansible.windows.win_command: hostname
+      register: hostname_result
+      changed_when: false
+
+    - name: "03 - Servidor acessado"
+      ansible.builtin.debug:
+        msg: "Servidor Windows: {{ hostname_result.stdout | trim }}"
+
+
+    # ------------------------------------------------------------
+    # 4. Testar execucao PowerShell
+    # ------------------------------------------------------------
+    - name: "04 - Testar execucao PowerShell"
+      ansible.windows.win_shell: |
+        Write-Output "PowerShell executado com sucesso pelo AWX"
+        Write-Output "Usuario: $(whoami)"
+        Write-Output "Servidor: $env:COMPUTERNAME"
+        Write-Output "PowerShell: $($PSVersionTable.PSVersion)"
+        Write-Output "Data: $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')"
+      register: powershell_test
+      changed_when: false
+
+    - name: "04 - Resultado PowerShell"
+      ansible.builtin.debug:
+        var: powershell_test.stdout_lines
+
+
+    # ------------------------------------------------------------
+    # 5. Validar privilegio administrativo
+    # ------------------------------------------------------------
+    - name: "05 - Verificar se usuario possui privilegio administrativo"
+      ansible.windows.win_shell: |
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+        $isAdmin = $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+
+        Write-Output "Usuario: $($identity.Name)"
+
+        if ($isAdmin) {
+            Write-Output "ADMINISTRADOR: SIM"
+        }
+        else {
+            Write-Output "ADMINISTRADOR: NAO"
+        }
+      register: admin_test
+      changed_when: false
+
+    - name: "05 - Resultado privilegio administrativo"
+      ansible.builtin.debug:
+        var: admin_test.stdout_lines
+
+
+    # ------------------------------------------------------------
+    # 6. Testar criacao de arquivo
+    # ------------------------------------------------------------
+    - name: "06 - Testar escrita no Windows"
+      ansible.windows.win_shell: |
+        $arquivo = Join-Path $env:TEMP "awx_test_usuario.txt"
+
+        "Teste AWX executado por $(whoami)" |
+        Out-File -FilePath $arquivo -Encoding UTF8
+
+        if (Test-Path $arquivo) {
+            Write-Output "CRIACAO_ARQUIVO: SUCESSO"
+            Write-Output "Arquivo: $arquivo"
+        }
+        else {
+            Write-Output "CRIACAO_ARQUIVO: FALHA"
+            exit 1
+        }
+      register: write_test
+
+    - name: "06 - Resultado teste de escrita"
+      ansible.builtin.debug:
+        var: write_test.stdout_lines
+
+
+    # ------------------------------------------------------------
+    # 7. Remover arquivo utilizado no teste
+    # ------------------------------------------------------------
+    - name: "07 - Remover arquivo temporario"
+      ansible.windows.win_shell: |
+        $arquivo = Join-Path $env:TEMP "awx_test_usuario.txt"
+
+        if (Test-Path $arquivo) {
+            Remove-Item $arquivo -Force
+        }
+
+        Write-Output "Arquivo temporario removido."
+      changed_when: false
+
+
+    # ------------------------------------------------------------
+    # 8. Resumo
+    # ------------------------------------------------------------
+    - name: "08 - RESUMO FINAL"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - " TESTE WINDOWS / AWX FINALIZADO COM SUCESSO"
+          - "=========================================================="
+          - "Servidor : {{ hostname_result.stdout | trim }}"
+          - "Usuario  : {{ whoami_result.stdout | trim }}"
+          - "WinRM    : OK"
+          - "Comandos : OK"
+          - "PowerShell: OK"
+          - "Escrita temporaria: OK"
+          - "=========================================================="
