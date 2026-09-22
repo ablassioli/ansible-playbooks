@@ -1,0 +1,139 @@
+---
+- name: Diagnosticar alerta de porta TCP
+  hosts: all
+  gather_facts: false
+  vars:
+    diag_porta: 6791
+    diag_destino: "{{ ansible_host | default(inventory_hostname) }}"
+    diag_windows: true
+    diag_servico: ""
+    diag_amostras: 3
+    diag_timeout: 5
+    diag_falhar_se_indisponivel: false
+
+  tasks:
+    - name: Validar parametros
+      ansible.builtin.assert:
+        that:
+          - diag_porta | int > 0
+          - diag_porta | int <= 65535
+          - diag_amostras | int >= 1
+          - diag_amostras | int <= 10
+          - diag_timeout | int >= 1
+          - diag_timeout | int <= 30
+        quiet: true
+
+    - name: Testar TCP a partir do Execution Environment do AWX
+      ansible.builtin.wait_for:
+        host: "{{ diag_destino }}"
+        port: "{{ diag_porta | int }}"
+        state: started
+        timeout: "{{ diag_timeout | int }}"
+        connect_timeout: 2
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+        ansible_shell_type: sh
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      register: diag_tcp
+      ignore_errors: true
+      loop: "{{ range(0, diag_amostras | int) | list }}"
+      loop_control:
+        pause: 2
+      changed_when: false
+
+    - name: Coletar evidencias Windows via WinRM
+      ansible.windows.win_powershell:
+        depth: 5
+        parameters:
+          Port: "{{ diag_porta | int }}"
+          ServiceName: "{{ diag_servico }}"
+        script: |
+          param([int]$Port, [string]$ServiceName)
+          $Ansible.Changed = $false
+          $r = @{ timestamp_utc = [DateTime]::UtcNow.ToString('o'); sockets_ok = $false; sockets = @(); errors = @() }
+          try {
+            $r.sockets = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object { $_.State -eq 'Listen' -and $_.LocalPort -eq $Port } | Select-Object LocalAddress, LocalPort, OwningProcess)
+            $r.sockets_ok = $true
+          } catch { $r.errors += "Sockets: $($_.Exception.Message)" }
+          try {
+            $ids = @($r.sockets | ForEach-Object { $_.OwningProcess })
+            $r.processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -in $ids } | Select-Object ProcessId, Name, ExecutablePath)
+            $r.services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { ($_.ProcessId -gt 0 -and $_.ProcessId -in $ids) -or ($ServiceName -and $_.Name -eq $ServiceName) } | Select-Object Name, DisplayName, State, StartMode, ProcessId, ExitCode)
+          } catch { $r.errors += "Processos/servicos: $($_.Exception.Message)" }
+          try {
+            $r.os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop | Select-Object LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize
+            $r.disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | Select-Object DeviceID, FreeSpace, Size)
+          } catch { $r.errors += "Recursos: $($_.Exception.Message)" }
+          $r.events = @()
+          foreach ($log in @('System', 'Application')) {
+            try {
+              $r.events += @(Get-WinEvent -FilterHashtable @{ LogName=$log; StartTime=(Get-Date).AddHours(-2); Level=@(1,2,3) } -MaxEvents 50 -ErrorAction Stop | Select-Object TimeCreated, LogName, Id, ProviderName, LevelDisplayName, Message)
+            } catch {
+              if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $r.errors += "Eventos $log : $($_.Exception.Message)" }
+            }
+          }
+          $Ansible.Result = $r
+      register: diag_windows_result
+      when: diag_windows | bool
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+    - name: Consolidar resultados dos testes
+      ansible.builtin.set_fact:
+        diag_sucessos: "{{ diag_tcp.results | rejectattr('failed', 'equalto', true) | list | length }}"
+        diag_ss_valido: "{{ (diag_windows_result | default({})).get('result', {}).get('sockets_ok', false) }}"
+        diag_listener: "{{ (diag_windows_result | default({})).get('result', {}).get('sockets', []) | length > 0 }}"
+
+    - name: Classificar evidencias sem atribuir causa nao comprovada
+      ansible.builtin.set_fact:
+        diag_classificacao: >-
+          {% if diag_sucessos | int == diag_amostras | int %}
+          TCP acessivel nas amostras. Alerta nao reproduzido deste ponto de rede.
+          {% elif diag_sucessos | int > 0 %}
+          Resultado TCP variavel. Possivel intermitencia; correlacionar horarios e rota.
+          {% elif diag_ss_valido | bool and not diag_listener | bool %}
+          TCP indisponivel e nenhum listener observado no host Windows para esta porta.
+          Investigar processo, configuracao e logs; causa-raiz ainda nao comprovada.
+          {% elif diag_ss_valido | bool and diag_listener | bool %}
+          TCP indisponivel a partir do AWX, com listener presente no host Windows.
+          Investigar endereco de bind, DNS, rota, firewall e saturacao.
+          {% else %}
+          TCP indisponivel a partir do AWX; evidencia local ausente ou coleta falhou.
+          Nao e possivel distinguir falha de aplicacao, DNS, rede ou firewall.
+          {% endif %}
+
+    - name: Montar relatorio por host
+      ansible.builtin.set_fact:
+        diag_relatorio:
+          host_inventario: "{{ inventory_hostname }}"
+          destino: "{{ diag_destino }}"
+          porta: "{{ diag_porta | int }}"
+          origem_teste: Execution Environment do AWX
+          classificacao: "{{ diag_classificacao | trim }}"
+          sucessos: "{{ diag_sucessos | int }}"
+          amostras: "{{ diag_amostras | int }}"
+          tcp: "{{ diag_tcp.results }}"
+          windows: "{{ diag_windows_result | default({'coleta': 'nao habilitada'}) }}"
+          historico_monitoramento: Nao consultado; requer integracao com a origem do alerta.
+
+    - name: Mostrar relatorio no job
+      ansible.builtin.debug:
+        var: diag_relatorio
+
+    - name: Publicar relatorios como estatistica global para o AWX
+      ansible.builtin.set_stats:
+        data:
+          diagnostico_portas: "{{ dict(ansible_play_hosts | zip(ansible_play_hosts | map('extract', hostvars, 'diag_relatorio'))) }}"
+        per_host: false
+        aggregate: false
+      run_once: true
+
+    - name: Marcar job como falho quando solicitado e houver amostra indisponivel
+      ansible.builtin.fail:
+        msg: "{{ diag_classificacao | trim }}"
+      when:
+        - diag_falhar_se_indisponivel | bool
+        - diag_sucessos | int < diag_amostras | int
