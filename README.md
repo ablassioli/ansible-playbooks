@@ -17,3 +17,8 @@ Repositório destinado ao armazenamento e versionamento de playbooks Ansible.
 - O alerta da imagem informa porta 6791 indisponivel, associada a APP - SAP BW. Ele nao identifica o processo ou servico Windows responsavel. Este playbook coleta evidencias e classifica o problema sem presumir uma causa-raiz.
 
 - 
+test_windows_user.yml
+
+Este playbook foi desenvolvido para validar a conectividade, autenticação e permissões de acesso do AWX a servidores Microsoft Windows utilizando WinRM.
+
+Ele permite confirmar se a credencial configurada no Job Template do AWX consegue estabelecer uma sessão remota no servidor Windows e executar comandos e scripts PowerShell corretamente.
