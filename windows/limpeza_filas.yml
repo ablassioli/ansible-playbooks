@@ -1,0 +1,113 @@
+---
+- name: Limpar filas de impressao e logs do SAPSprint
+  hosts: print_servers
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    servicos_parada: [SAPSprint, Spooler, LPDSVC]
+    servicos_inicio: [Spooler, SAPSprint, LPDSVC]
+    diretorio_fila: 'C:\Windows\System32\spool\PRINTERS'
+    diretorio_logs: 'C:\Program Files\SAP\SAPSPrint\Logs'
+
+  pre_tasks:
+    - name: Consultar os servicos obrigatorios
+      ansible.windows.win_service_info:
+        name: '{{ item }}'
+      loop: '{{ servicos_parada }}'
+      register: consulta_servicos
+
+    - name: Validar existencia dos servicos
+      ansible.builtin.assert:
+        that: item.exists
+        fail_msg: 'Servico obrigatorio ausente: {{ item.item }}'
+      loop: '{{ consulta_servicos.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: Consultar diretorios
+      ansible.windows.win_stat:
+        path: '{{ item }}'
+      loop:
+        - '{{ diretorio_fila }}'
+        - '{{ diretorio_logs }}'
+      register: consulta_diretorios
+
+    - name: Validar diretorios antes de interromper a impressao
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir | default(false)
+          - not (item.stat.isjunction | default(false))
+          - not (item.stat.islnk | default(false))
+        fail_msg: 'Diretorio ausente, invalido ou redirecionado: {{ item.item }}'
+      loop: '{{ consulta_diretorios.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+  tasks:
+    - name: Informar comportamento do modo Check
+      ansible.builtin.debug:
+        msg: 'Check valida os pre-requisitos; nao para servicos nem simula a exclusao.'
+      when: ansible_check_mode
+
+    - name: Executar manutencao
+      when: not ansible_check_mode
+      block:
+        - name: Parar todos os servicos antes de excluir arquivos
+          ansible.windows.win_service:
+            name: '{{ item }}'
+            state: stopped
+          loop: '{{ servicos_parada }}'
+
+        - name: Localizar arquivos da fila sem percorrer subpastas
+          ansible.windows.win_find:
+            paths: '{{ diretorio_fila }}'
+            file_type: file
+            recurse: false
+            hidden: true
+            get_checksum: false
+          register: arquivos_fila
+
+        - name: Localizar logs sem percorrer subpastas
+          ansible.windows.win_find:
+            paths: '{{ diretorio_logs }}'
+            file_type: file
+            recurse: false
+            hidden: true
+            get_checksum: false
+          register: arquivos_logs
+
+        - name: Excluir arquivos da fila de impressao
+          ansible.windows.win_file:
+            path: '{{ item.path }}'
+            state: absent
+          loop: '{{ arquivos_fila.files }}'
+          loop_control:
+            label: '{{ item.path }}'
+
+        - name: Excluir logs preservando extensao dbg em qualquer capitalizacao
+          ansible.windows.win_file:
+            path: '{{ item.path }}'
+            state: absent
+          loop: '{{ arquivos_logs.files }}'
+          loop_control:
+            label: '{{ item.path }}'
+          when: not (item.filename is search('(?i)\.dbg$'))
+
+      always:
+        - name: Tentar iniciar cada servico mesmo se outro falhar
+          ansible.windows.win_service:
+            name: '{{ item }}'
+            state: started
+          loop: '{{ servicos_inicio }}'
+          register: inicio_servicos
+          ignore_errors: true
+
+        - name: Reportar falhas na recuperacao dos servicos
+          ansible.builtin.assert:
+            that: not (item.failed | default(false))
+            fail_msg: 'Falha ao iniciar {{ item.item }}: {{ item.msg | default("consulte o log do job") }}'
+          loop: '{{ inicio_servicos.results }}'
+          loop_control:
+            label: '{{ item.item }}'
