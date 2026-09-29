@@ -1,0 +1,130 @@
+---
+- name: Diagnosticar maiores arquivos e pastas Windows
+  hosts: windows
+  gather_facts: false
+  serial: 1
+  vars:
+    scan_path: 'C:\'
+    top_n: 20
+    max_minutes: 30
+  tasks:
+    - name: Analisar ocupacao sem excluir ou alterar arquivos
+      ansible.windows.win_powershell:
+        depth: 5
+        parameters:
+          ScanPath: "{{ scan_path }}"
+          TopN: "{{ top_n | int }}"
+          MaxMinutes: "{{ max_minutes | int }}"
+        script: |
+          [CmdletBinding(SupportsShouldProcess)]
+          param(
+              [string]$ScanPath = 'C:\',
+              [ValidateRange(1,200)][int]$TopN = 20,
+              [ValidateRange(1,1440)][int]$MaxMinutes = 30
+          )
+          $Ansible.Changed = $false
+          $root = Get-Item -LiteralPath $ScanPath -Force -ErrorAction Stop
+          if (-not $root.PSIsContainer -or $root.PSProvider.Name -ne 'FileSystem' -or
+              $root.FullName -notmatch '^[A-Za-z]:\\' -or
+              ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw 'Informe uma pasta local, sem junction/symlink, por exemplo C:\.'
+          }
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          $dirs = @{}
+          $stack = New-Object 'System.Collections.Generic.Stack[string]'
+          $stack.Push($root.FullName)
+          $dirs[$root.FullName] = [pscustomobject]@{Path=$root.FullName; Bytes=[long]0; Files=[long]0; Parent=$null}
+          $order = New-Object 'System.Collections.Generic.List[string]'
+          $largest = New-Object 'System.Collections.Generic.List[object]'
+          $errorsSample = New-Object 'System.Collections.Generic.List[object]'
+          $errorCount = 0
+          $skippedLinks = 0
+          $fileCount = [long]0
+          $timedOut = $false
+          while ($stack.Count -gt 0) {
+              if ($watch.Elapsed.TotalMinutes -ge $MaxMinutes) { $timedOut=$true; break }
+              $current = $stack.Pop()
+              $order.Add($current)
+              # Enumeracao por pasta: evita guardar todos os arquivos do volume em memoria.
+              $scanErrors = @()
+              Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrors | ForEach-Object {
+                  if ($watch.Elapsed.TotalMinutes -ge $MaxMinutes) {
+                      $timedOut = $true
+                  } elseif ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                      $skippedLinks++
+                  } elseif ($_.PSIsContainer) {
+                      $dirs[$_.FullName] = [pscustomobject]@{Path=$_.FullName; Bytes=[long]0; Files=[long]0; Parent=$current}
+                      $stack.Push($_.FullName)
+                  } else {
+                      $size = [long]$_.Length
+                      $dirs[$current].Bytes += $size
+                      $dirs[$current].Files++
+                      $fileCount++
+                      $largest.Add([pscustomobject]@{
+                          path=$_.FullName; bytes=$size; gib=[math]::Round($size/1GB,3)
+                          modified_utc=$_.LastWriteTimeUtc.ToString('o')
+                      })
+                      if ($largest.Count -ge ($TopN * 2)) {
+                          $keep = @($largest | Sort-Object bytes -Descending | Select-Object -First $TopN)
+                          $largest.Clear()
+                          foreach ($entry in $keep) { $largest.Add($entry) }
+                      }
+                  }
+              }
+              foreach ($err in $scanErrors) {
+                  $errorCount++
+                  if ($errorsSample.Count -lt 20) {
+                      $errorsSample.Add([pscustomobject]@{directory=$current; message=$err.Exception.Message})
+                  }
+              }
+              if ($timedOut) { break }
+          }
+          # Propaga os totais dos filhos aos pais, sem reler arquivos.
+          for ($i=$order.Count-1; $i -ge 0; $i--) {
+              $node = $dirs[$order[$i]]
+              if ($null -ne $node.Parent) {
+                  $dirs[$node.Parent].Bytes += $node.Bytes
+                  $dirs[$node.Parent].Files += $node.Files
+              }
+          }
+          function Format-Directory($node) {
+              [pscustomobject]@{path=$node.Path; bytes=$node.Bytes; gib=[math]::Round($node.Bytes/1GB,3); files=$node.Files}
+          }
+          $drive = New-Object System.IO.DriveInfo -ArgumentList ([IO.Path]::GetPathRoot($root.FullName))
+          $Ansible.Result = @{
+              computer=$env:COMPUTERNAME
+              scan_path=$root.FullName
+              collected_utc=[DateTime]::UtcNow.ToString('o')
+              elapsed_seconds=[math]::Round($watch.Elapsed.TotalSeconds,1)
+              partial=($timedOut -or $errorCount -gt 0)
+              timed_out=$timedOut
+              errors_count=$errorCount
+              errors_sample=@($errorsSample.ToArray())
+              skipped_reparse_points=$skippedLinks
+              scanned_files=$fileCount
+              scanned_directories=$order.Count
+              logical_bytes=$dirs[$root.FullName].Bytes
+              volume=@{
+                  name=$drive.Name; total_gib=[math]::Round($drive.TotalSize/1GB,2)
+                  free_gib=[math]::Round($drive.TotalFreeSpace/1GB,2)
+                  used_percent=[math]::Round(100*($drive.TotalSize-$drive.TotalFreeSpace)/$drive.TotalSize,2)
+              }
+              top_files=@($largest | Sort-Object bytes -Descending | Select-Object -First $TopN)
+              top_directories=@($dirs.Values | Where-Object { $_.Path -ne $root.FullName } |
+                  Sort-Object Bytes -Descending | Select-Object -First $TopN | ForEach-Object { Format-Directory $_ })
+              root_children=@($dirs.Values | Where-Object { $_.Parent -eq $root.FullName } |
+                  Sort-Object Bytes -Descending | ForEach-Object { Format-Directory $_ })
+          }
+      register: disk_scan
+      changed_when: false
+
+    - name: Exibir relatorio no output do job
+      ansible.builtin.debug:
+        var: disk_scan.result
+
+    - name: Publicar relatorio nos artifacts do AWX
+      ansible.builtin.set_stats:
+        data:
+          disk_reports: "{{ {inventory_hostname: disk_scan.result} }}"
+        per_host: false
+        aggregate: true
