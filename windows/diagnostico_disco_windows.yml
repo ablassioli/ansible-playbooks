@@ -1,6 +1,6 @@
 ---
 - name: Diagnosticar maiores arquivos e pastas Windows
-  hosts: windows
+  hosts: all
   gather_facts: false
   serial: 1
   vars:
